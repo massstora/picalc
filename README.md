@@ -7,12 +7,15 @@ stable before output is truncated to the requested length.
 
 On Linux, `picalc` detects unique physical CPU cores from `/sys` topology data
 and uses that many worker threads for the Chudnovsky binary-splitting phase. SMT
-/ hyperthread siblings are counted as one physical core.
+/ hyperthread siblings are counted as one physical core. Worker threads are
+pinned to one representative logical CPU for each physical core when Linux
+affinity APIs are available.
 
 The implementation keeps GMP values thread-local, combines completed worker
 chunks as they are joined, clears large temporaries as soon as they are no longer
 needed, and streams decimal output instead of first creating one full output
-string in memory.
+string in memory. Per-thread task/result headers are cache-line aligned to avoid
+false sharing in the program's own worker metadata.
 
 ## Build
 

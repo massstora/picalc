@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include "chudnovsky.h"
@@ -6,6 +7,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +17,7 @@
 enum {
     CHUDNOVSKY_DIGITS_PER_TERM = 14,
     GUARD_DIGITS = 20,
+    CACHE_LINE_SIZE = 64,
     MIN_TERMS_PER_THREAD = 256
 };
 
@@ -27,19 +30,22 @@ static void usage(FILE *stream) {
 struct core_id {
     long package_id;
     long core_id;
+    unsigned int cpu_id;
 };
 
 struct split_result {
     mpz_t P;
     mpz_t Q;
     mpz_t T;
-};
+} __attribute__((aligned(CACHE_LINE_SIZE)));
 
 struct split_task {
     unsigned long start;
     unsigned long end;
+    unsigned int cpu_id;
+    int has_cpu_affinity;
     struct split_result *result;
-};
+} __attribute__((aligned(CACHE_LINE_SIZE)));
 
 static int parse_digits(const char *text, unsigned long *digits) {
     char *end = NULL;
@@ -138,7 +144,9 @@ static int has_core_id(const struct core_id *cores, size_t count, long package_i
     return 0;
 }
 
-static unsigned int detect_physical_cores(void) {
+static unsigned int detect_physical_core_cpus(unsigned int **cpu_ids) {
+    *cpu_ids = NULL;
+
     DIR *dir = opendir("/sys/devices/system/cpu");
     if (dir == NULL) {
         return 1;
@@ -195,15 +203,28 @@ static unsigned int detect_physical_cores(void) {
 
         cores[count].package_id = package_id;
         cores[count].core_id = core_id;
+        cores[count].cpu_id = (unsigned int)cpu;
         count++;
     }
 
-    free(cores);
     closedir(dir);
 
     if (count == 0 || count > UINT_MAX) {
+        free(cores);
         return 1;
     }
+
+    *cpu_ids = calloc(count, sizeof(**cpu_ids));
+    if (*cpu_ids == NULL) {
+        free(cores);
+        return 1;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        (*cpu_ids)[i] = cores[i].cpu_id;
+    }
+
+    free(cores);
     return (unsigned int)count;
 }
 
@@ -274,11 +295,20 @@ static void combine_split_results(struct split_result *left, const struct split_
 
 static void *run_split_task(void *arg) {
     struct split_task *task = arg;
+
+    if (task->has_cpu_affinity && task->cpu_id < CPU_SETSIZE) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(task->cpu_id, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    }
+
     binary_split(task->start, task->end, task->result->P, task->result->Q, task->result->T);
     return NULL;
 }
 
-static int binary_split_threaded(unsigned long terms, unsigned int requested_threads,
+static int binary_split_threaded(unsigned long terms, const unsigned int *cpu_ids,
+                                 unsigned int requested_threads,
                                  mpz_t P, mpz_t Q, mpz_t T) {
     unsigned int threads = requested_threads;
     unsigned long max_useful_threads = terms / MIN_TERMS_PER_THREAD;
@@ -311,6 +341,8 @@ static int binary_split_threaded(unsigned long terms, unsigned int requested_thr
         split_result_init(&results[i]);
         tasks[i].start = ((unsigned long)i * terms) / threads;
         tasks[i].end = ((unsigned long)(i + 1) * terms) / threads;
+        tasks[i].cpu_id = cpu_ids != NULL ? cpu_ids[i] : 0;
+        tasks[i].has_cpu_affinity = cpu_ids != NULL;
         tasks[i].result = &results[i];
     }
 
@@ -420,6 +452,8 @@ static int compute_pi(mpz_t pi_scaled, unsigned long digits) {
     unsigned long scale_digits = 0;
     unsigned long sqrt_scale_digits = 0;
     unsigned long terms = 0;
+    unsigned int *cpu_ids = NULL;
+    unsigned int physical_cores = 0;
 
     if (checked_add_ul(digits, GUARD_DIGITS, &scale_digits) != 0 ||
         checked_mul_ul(scale_digits, 2, &sqrt_scale_digits) != 0 ||
@@ -430,10 +464,13 @@ static int compute_pi(mpz_t pi_scaled, unsigned long digits) {
     mpz_t P, Q, T, sqrt_arg, sqrt_scaled, guard_divisor;
     mpz_inits(P, Q, T, sqrt_arg, sqrt_scaled, guard_divisor, NULL);
 
-    if (binary_split_threaded(terms, detect_physical_cores(), P, Q, T) != 0) {
+    physical_cores = detect_physical_core_cpus(&cpu_ids);
+    if (binary_split_threaded(terms, cpu_ids, physical_cores, P, Q, T) != 0) {
+        free(cpu_ids);
         mpz_clears(P, Q, T, sqrt_arg, sqrt_scaled, guard_divisor, NULL);
         return -1;
     }
+    free(cpu_ids);
     mpz_clear(P);
 
     mpz_ui_pow_ui(sqrt_arg, 10, sqrt_scale_digits);
