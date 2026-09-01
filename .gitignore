@@ -1,0 +1,5 @@
+build/
+picalc
+*.o
+*.out
+pi*.txt
