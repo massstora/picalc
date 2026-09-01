@@ -50,3 +50,11 @@ Examples:
 ```sh
 make test
 ```
+
+## Native Bigint Backend
+
+An experimental native bigint engine lives in `src/native_bigint.c`. It uses
+little-endian `uint64_t` limbs and keeps capacity inside each bigint so repeated
+operations can reuse buffers. The current GMP backend remains the production
+calculator path while the native backend grows enough arithmetic to support
+Chudnovsky end to end.
