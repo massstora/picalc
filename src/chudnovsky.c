@@ -4,13 +4,13 @@
 
 #include <dirent.h>
 #include <errno.h>
-#include <gmp.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+
+#include <gmp.h>
 
 enum {
     CHUDNOVSKY_DIGITS_PER_TERM = 14,
@@ -82,6 +82,14 @@ static int checked_add_ul(unsigned long a, unsigned long b, unsigned long *out) 
     return 0;
 }
 
+static int checked_mul_ul(unsigned long a, unsigned long b, unsigned long *out) {
+    if (a != 0 && b > ULONG_MAX / a) {
+        return -1;
+    }
+    *out = a * b;
+    return 0;
+}
+
 static int checked_terms_for_digits(unsigned long digits, unsigned long *terms) {
     unsigned long precision_digits = 0;
     if (checked_add_ul(digits, GUARD_DIGITS, &precision_digits) != 0) {
@@ -102,6 +110,12 @@ static void split_result_init(struct split_result *result) {
 
 static void split_result_clear(struct split_result *result) {
     mpz_clears(result->P, result->Q, result->T, NULL);
+}
+
+static void split_result_move(struct split_result *dst, struct split_result *src) {
+    mpz_swap(dst->P, src->P);
+    mpz_swap(dst->Q, src->Q);
+    mpz_swap(dst->T, src->T);
 }
 
 static int parse_long_file(const char *path, long *value) {
@@ -308,23 +322,34 @@ static int binary_split_threaded(unsigned long terms, unsigned int requested_thr
     }
 
     int failed = created != threads;
+    int have_accumulator = 0;
+    struct split_result accumulator;
+    split_result_init(&accumulator);
+
     for (unsigned int i = 0; i < created; i++) {
         if (pthread_join(workers[i], NULL) != 0) {
             failed = 1;
+            continue;
         }
+
+        if (!failed && !have_accumulator) {
+            split_result_move(&accumulator, &results[i]);
+            have_accumulator = 1;
+        } else if (!failed) {
+            combine_split_results(&accumulator, &results[i]);
+        }
+
+        split_result_clear(&results[i]);
+        split_result_init(&results[i]);
     }
 
-    if (!failed) {
-        for (unsigned int stride = 1; stride < threads; stride *= 2) {
-            for (unsigned int i = 0; i + stride < threads; i += stride * 2) {
-                combine_split_results(&results[i], &results[i + stride]);
-            }
-        }
-        mpz_set(P, results[0].P);
-        mpz_set(Q, results[0].Q);
-        mpz_set(T, results[0].T);
+    if (!failed && have_accumulator) {
+        mpz_swap(P, accumulator.P);
+        mpz_swap(Q, accumulator.Q);
+        mpz_swap(T, accumulator.T);
     }
 
+    split_result_clear(&accumulator);
     for (unsigned int i = 0; i < threads; i++) {
         split_result_clear(&results[i]);
     }
@@ -336,91 +361,96 @@ static int binary_split_threaded(unsigned long terms, unsigned int requested_thr
 }
 
 static int write_pi(FILE *stream, const mpz_t pi_scaled, unsigned long digits) {
-    char *raw = mpz_get_str(NULL, 10, pi_scaled);
-    if (raw == NULL) {
-        return -1;
-    }
-
-    size_t len = strlen(raw);
     if (digits == 0) {
-        if (fprintf(stream, "%s\n", raw) < 0) {
-            free(raw);
+        if (mpz_out_str(stream, 10, pi_scaled) == 0 || fputc('\n', stream) == EOF) {
             return -1;
         }
-        free(raw);
         return 0;
     }
 
     size_t requested = (size_t)digits;
     if (requested != digits) {
-        free(raw);
         return -1;
     }
 
-    size_t int_len = len > requested ? len - requested : 1;
-    if (fwrite(raw, 1, int_len, stream) != int_len || fputc('.', stream) == EOF) {
-        free(raw);
-        return -1;
+    mpz_t divisor, int_part, frac_part, digit_floor;
+    mpz_inits(divisor, int_part, frac_part, digit_floor, NULL);
+
+    mpz_ui_pow_ui(divisor, 10, digits);
+    mpz_tdiv_qr(int_part, frac_part, pi_scaled, divisor);
+
+    int ok = 1;
+    if (mpz_out_str(stream, 10, int_part) == 0 || fputc('.', stream) == EOF) {
+        ok = 0;
     }
 
-    if (len <= requested) {
-        size_t zero_count = requested - len + 1;
-        for (size_t i = 0; i < zero_count; i++) {
-            if (fputc('0', stream) == EOF) {
-                free(raw);
-                return -1;
+    if (ok) {
+        size_t frac_digits = mpz_sizeinbase(frac_part, 10);
+        if (mpz_cmp_ui(frac_part, 0) == 0) {
+            frac_digits = 1;
+        } else if (frac_digits > 1) {
+            mpz_ui_pow_ui(digit_floor, 10, frac_digits - 1);
+            if (mpz_cmp(frac_part, digit_floor) < 0) {
+                frac_digits--;
             }
         }
-        if (fputs(raw, stream) == EOF) {
-            free(raw);
-            return -1;
+
+        while (frac_digits < requested) {
+            if (fputc('0', stream) == EOF) {
+                ok = 0;
+                break;
+            }
+            frac_digits++;
         }
-    } else {
-        if (fwrite(raw + int_len, 1, requested, stream) != requested) {
-            free(raw);
-            return -1;
+
+        if (ok && mpz_out_str(stream, 10, frac_part) == 0) {
+            ok = 0;
         }
     }
 
-    if (fputc('\n', stream) == EOF) {
-        free(raw);
-        return -1;
+    if (ok && fputc('\n', stream) == EOF) {
+        ok = 0;
     }
 
-    free(raw);
-    return 0;
+    mpz_clears(divisor, int_part, frac_part, digit_floor, NULL);
+    return ok ? 0 : -1;
 }
 
 static int compute_pi(mpz_t pi_scaled, unsigned long digits) {
     unsigned long scale_digits = 0;
+    unsigned long sqrt_scale_digits = 0;
     unsigned long terms = 0;
 
     if (checked_add_ul(digits, GUARD_DIGITS, &scale_digits) != 0 ||
+        checked_mul_ul(scale_digits, 2, &sqrt_scale_digits) != 0 ||
         checked_terms_for_digits(digits, &terms) != 0) {
         return -1;
     }
 
-    mpz_t P, Q, T, sqrt_arg, sqrt_scaled, pow10, numerator, guard_divisor;
-    mpz_inits(P, Q, T, sqrt_arg, sqrt_scaled, pow10, numerator, guard_divisor, NULL);
+    mpz_t P, Q, T, sqrt_arg, sqrt_scaled, guard_divisor;
+    mpz_inits(P, Q, T, sqrt_arg, sqrt_scaled, guard_divisor, NULL);
 
     if (binary_split_threaded(terms, detect_physical_cores(), P, Q, T) != 0) {
-        mpz_clears(P, Q, T, sqrt_arg, sqrt_scaled, pow10, numerator, guard_divisor, NULL);
+        mpz_clears(P, Q, T, sqrt_arg, sqrt_scaled, guard_divisor, NULL);
         return -1;
     }
+    mpz_clear(P);
 
-    mpz_ui_pow_ui(pow10, 10, scale_digits);
-    mpz_mul(sqrt_arg, pow10, pow10);
+    mpz_ui_pow_ui(sqrt_arg, 10, sqrt_scale_digits);
     mpz_mul_ui(sqrt_arg, sqrt_arg, 10005);
     mpz_sqrt(sqrt_scaled, sqrt_arg);
+    mpz_clear(sqrt_arg);
 
-    mpz_mul(numerator, Q, sqrt_scaled);
-    mpz_mul_ui(numerator, numerator, 426880);
-    mpz_tdiv_q(pi_scaled, numerator, T);
+    mpz_mul(pi_scaled, Q, sqrt_scaled);
+    mpz_clears(Q, sqrt_scaled, NULL);
+    mpz_mul_ui(pi_scaled, pi_scaled, 426880);
+    mpz_tdiv_q(pi_scaled, pi_scaled, T);
+    mpz_clear(T);
 
     mpz_ui_pow_ui(guard_divisor, 10, GUARD_DIGITS);
     mpz_tdiv_q(pi_scaled, pi_scaled, guard_divisor);
 
-    mpz_clears(P, Q, T, sqrt_arg, sqrt_scaled, pow10, numerator, guard_divisor, NULL);
+    mpz_clear(guard_divisor);
     return 0;
 }
 
