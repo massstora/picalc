@@ -13,6 +13,9 @@
 #include <string.h>
 
 #include <gmp.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 enum {
     CHUDNOVSKY_DIGITS_PER_TERM = 14,
@@ -25,6 +28,23 @@ static const unsigned long C3_OVER_24 = 10939058860032000UL;
 
 static void usage(FILE *stream) {
     fputs("usage: ./picalc DIGITS [-o FILE]\n", stream);
+}
+
+static void tune_allocator(unsigned int worker_count) {
+#ifdef __GLIBC__
+    int arenas = worker_count > 0 && worker_count < (unsigned int)INT_MAX
+                     ? (int)worker_count + 1
+                     : 2;
+    mallopt(M_ARENA_MAX, arenas);
+#else
+    (void)worker_count;
+#endif
+}
+
+static void trim_allocator(void) {
+#ifdef __GLIBC__
+    malloc_trim(0);
+#endif
 }
 
 struct core_id {
@@ -277,7 +297,34 @@ static void binary_split(unsigned long a, unsigned long b, mpz_t P, mpz_t Q, mpz
     mpz_clears(P1, Q1, T1, P2, Q2, T2, tmp, NULL);
 }
 
-static void combine_split_results(struct split_result *left, const struct split_result *right) {
+static void binary_split_final(unsigned long a, unsigned long b, mpz_t Q, mpz_t T) {
+    if (b - a == 1) {
+        mpz_t P;
+
+        mpz_init(P);
+        binary_split(a, b, P, Q, T);
+        mpz_clear(P);
+        return;
+    }
+
+    unsigned long m = a + (b - a) / 2;
+    mpz_t P1, Q1, T1, P2, Q2, T2, tmp;
+
+    mpz_inits(P1, Q1, T1, P2, Q2, T2, tmp, NULL);
+    binary_split(a, m, P1, Q1, T1);
+    binary_split(m, b, P2, Q2, T2);
+
+    mpz_mul(Q, Q1, Q2);
+
+    mpz_mul(T, T1, Q2);
+    mpz_mul(tmp, P1, T2);
+    mpz_add(T, T, tmp);
+
+    mpz_clears(P1, Q1, T1, P2, Q2, T2, tmp, NULL);
+}
+
+static void combine_split_results(struct split_result *left, const struct split_result *right,
+                                  int keep_product) {
     mpz_t combined_T, tmp;
 
     mpz_inits(combined_T, tmp, NULL);
@@ -286,7 +333,9 @@ static void combine_split_results(struct split_result *left, const struct split_
     mpz_mul(tmp, left->P, right->T);
     mpz_add(combined_T, combined_T, tmp);
 
-    mpz_mul(left->P, left->P, right->P);
+    if (keep_product) {
+        mpz_mul(left->P, left->P, right->P);
+    }
     mpz_mul(left->Q, left->Q, right->Q);
     mpz_set(left->T, combined_T);
 
@@ -309,7 +358,7 @@ static void *run_split_task(void *arg) {
 
 static int binary_split_threaded(unsigned long terms, const unsigned int *cpu_ids,
                                  unsigned int requested_threads,
-                                 mpz_t P, mpz_t Q, mpz_t T) {
+                                 mpz_t Q, mpz_t T) {
     unsigned int threads = requested_threads;
     unsigned long max_useful_threads = terms / MIN_TERMS_PER_THREAD;
 
@@ -323,7 +372,7 @@ static int binary_split_threaded(unsigned long terms, const unsigned int *cpu_id
         threads = (unsigned int)terms;
     }
     if (threads < 2) {
-        binary_split(0, terms, P, Q, T);
+        binary_split_final(0, terms, Q, T);
         return 0;
     }
 
@@ -368,7 +417,7 @@ static int binary_split_threaded(unsigned long terms, const unsigned int *cpu_id
             split_result_move(&accumulator, &results[i]);
             have_accumulator = 1;
         } else if (!failed) {
-            combine_split_results(&accumulator, &results[i]);
+            combine_split_results(&accumulator, &results[i], i + 1 < created);
         }
 
         split_result_clear(&results[i]);
@@ -376,7 +425,6 @@ static int binary_split_threaded(unsigned long terms, const unsigned int *cpu_id
     }
 
     if (!failed && have_accumulator) {
-        mpz_swap(P, accumulator.P);
         mpz_swap(Q, accumulator.Q);
         mpz_swap(T, accumulator.T);
     }
@@ -461,17 +509,17 @@ static int compute_pi(mpz_t pi_scaled, unsigned long digits) {
         return -1;
     }
 
-    mpz_t P, Q, T, sqrt_arg, sqrt_scaled, guard_divisor;
-    mpz_inits(P, Q, T, sqrt_arg, sqrt_scaled, guard_divisor, NULL);
+    mpz_t Q, T, sqrt_arg, sqrt_scaled, guard_divisor;
+    mpz_inits(Q, T, sqrt_arg, sqrt_scaled, guard_divisor, NULL);
 
     physical_cores = detect_physical_core_cpus(&cpu_ids);
-    if (binary_split_threaded(terms, cpu_ids, physical_cores, P, Q, T) != 0) {
+    tune_allocator(physical_cores);
+    if (binary_split_threaded(terms, cpu_ids, physical_cores, Q, T) != 0) {
         free(cpu_ids);
-        mpz_clears(P, Q, T, sqrt_arg, sqrt_scaled, guard_divisor, NULL);
+        mpz_clears(Q, T, sqrt_arg, sqrt_scaled, guard_divisor, NULL);
         return -1;
     }
     free(cpu_ids);
-    mpz_clear(P);
 
     mpz_ui_pow_ui(sqrt_arg, 10, sqrt_scale_digits);
     mpz_mul_ui(sqrt_arg, sqrt_arg, 10005);
@@ -480,14 +528,17 @@ static int compute_pi(mpz_t pi_scaled, unsigned long digits) {
 
     mpz_mul(pi_scaled, Q, sqrt_scaled);
     mpz_clears(Q, sqrt_scaled, NULL);
+    trim_allocator();
     mpz_mul_ui(pi_scaled, pi_scaled, 426880);
     mpz_tdiv_q(pi_scaled, pi_scaled, T);
     mpz_clear(T);
+    trim_allocator();
 
     mpz_ui_pow_ui(guard_divisor, 10, GUARD_DIGITS);
     mpz_tdiv_q(pi_scaled, pi_scaled, guard_divisor);
 
     mpz_clear(guard_divisor);
+    trim_allocator();
     return 0;
 }
 

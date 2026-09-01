@@ -15,7 +15,10 @@ The implementation keeps GMP values thread-local, combines completed worker
 chunks as they are joined, clears large temporaries as soon as they are no longer
 needed, and streams decimal output instead of first creating one full output
 string in memory. Per-thread task/result headers are cache-line aligned to avoid
-false sharing in the program's own worker metadata.
+false sharing in the program's own worker metadata. The top-level binary split
+skips materializing the final `P` product because pi only needs the final `Q`
+and `T`. On glibc systems, `picalc` also caps malloc arenas before the threaded
+GMP phase and trims freed heap pages after large temporaries are released.
 
 ## Build
 
